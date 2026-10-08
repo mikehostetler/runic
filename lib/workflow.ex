@@ -4422,9 +4422,16 @@ defmodule Runic.Workflow do
     wf = Enum.reduce(events, workflow, fn event, wf -> apply_event(wf, event) end)
 
     # 2. Run hook apply_fns if present (collected during execute, not serializable)
-    build_event_count = length(wf.build_log)
-    wf = apply_hook_fns(wf, runnable.hook_apply_fns || [])
-    dynamic_build_events = wf |> build_log() |> Enum.drop(build_event_count)
+    {wf, dynamic_build_events} =
+      case runnable.hook_apply_fns || [] do
+        [] ->
+          {wf, []}
+
+        hook_apply_fns ->
+          build_event_count = length(wf.build_log)
+          wf = apply_hook_fns(wf, hook_apply_fns)
+          {wf, wf |> build_log() |> Enum.drop(build_event_count)}
+      end
 
     # 3. Coordination finalization (Join completion check, etc.)
     #    Returns {wf, derived_events} — derived events are already folded into wf
