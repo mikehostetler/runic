@@ -93,9 +93,15 @@ defmodule Runic.Workflow.HookRunner do
     end
   end
 
-  defp run_single_hook(hook, _event, _ctx, node, input_fact) when is_function(hook, 3) do
+  defp run_single_hook(hook, event, _ctx, node, input_fact) when is_function(hook, 3) do
+    fact =
+      case event do
+        %HookEvent{timing: :after, result: %Runic.Workflow.Fact{} = output_fact} -> output_fact
+        _ -> input_fact
+      end
+
     apply_fn = fn workflow ->
-      hook.(node, workflow, input_fact)
+      hook.(node, workflow, fact)
     end
 
     {:ok, [apply_fn]}
