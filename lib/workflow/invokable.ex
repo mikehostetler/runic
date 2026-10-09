@@ -748,10 +748,18 @@ defimpl Runic.Workflow.Invokable, for: Runic.Workflow.Join do
       join.joins
       |> Enum.map(&Map.get(possible_priors_by_parent, &1))
       |> Enum.reject(&is_nil/1)
-      |> Enum.map(& &1.value)
 
     if Enum.count(join.joins) == Enum.count(possible_priors) do
-      join_bindings_fact = Fact.new(value: possible_priors, ancestry: {join.hash, fact.hash})
+      parent =
+        Enum.max_by(
+          possible_priors,
+          &Workflow.activation_order_key(workflow, join, &1),
+          &>=/2,
+          fn -> fact end
+        )
+
+      join_bindings_fact =
+        Fact.new(value: Enum.map(possible_priors, & &1.value), ancestry: {join.hash, parent.hash})
 
       workflow =
         workflow
@@ -773,7 +781,9 @@ defimpl Runic.Workflow.Invokable, for: Runic.Workflow.Join do
                 |> Multigraph.update_labelled_edge(v1, v2, :joined, label: :join_satisfied)
           }
       end)
-      |> Workflow.draw_connection(join, join_bindings_fact, :produced, weight: causal_depth)
+      |> Workflow.draw_connection(join, join_bindings_fact, :produced,
+        weight: Workflow.ancestry_depth(workflow, join_bindings_fact)
+      )
       |> Workflow.run_after_hooks(join, join_bindings_fact)
     else
       Workflow.mark_runnable_as_ran(workflow, join, fact)
@@ -1093,23 +1103,27 @@ defimpl Runic.Workflow.Invokable, for: Runic.Workflow.FanIn do
           # reduce in FanOut emission order (list was prepended, so reverse)
           expected_in_order = Enum.reverse(expected_list)
 
-          sister_fact_values =
-            for origin <- expected_in_order do
-              sister_hash = seen_map[origin]
-              workflow.graph.vertices[sister_hash].value
-            end
-
-          reduced_value =
-            reduce_with_context(sister_fact_values, fan_in.init.(), fan_in.reducer, %{})
-
-          reduced_fact =
-            Fact.new(value: reduced_value, ancestry: {fan_in.hash, fact.hash})
-
           sister_facts =
             for origin <- expected_in_order do
               sister_hash = seen_map[origin]
               workflow.graph.vertices[sister_hash]
             end
+
+          reduced_value =
+            reduce_with_context(
+              Enum.map(sister_facts, & &1.value),
+              fan_in.init.(),
+              fan_in.reducer,
+              %{}
+            )
+
+          parent =
+            Enum.min_by(sister_facts, fn sister ->
+              {depth, id} = Workflow.activation_order_key(workflow, fan_in, sister)
+              {-depth, id}
+            end)
+
+          reduced_fact = Fact.new(value: reduced_value, ancestry: {fan_in.hash, parent.hash})
 
           workflow =
             Enum.reduce(sister_facts, workflow, fn sister_fact, wrk ->
@@ -1118,7 +1132,9 @@ defimpl Runic.Workflow.Invokable, for: Runic.Workflow.FanIn do
 
           workflow
           |> Workflow.log_fact(reduced_fact)
-          |> Workflow.draw_connection(fan_in, reduced_fact, :reduced, weight: causal_depth)
+          |> Workflow.draw_connection(fan_in, reduced_fact, :reduced,
+            weight: Workflow.ancestry_depth(workflow, reduced_fact)
+          )
           |> Workflow.run_after_hooks(fan_in, reduced_fact)
           |> Workflow.prepare_next_runnables(fan_in, reduced_fact)
           |> Workflow.mark_runnable_as_ran(fan_in, reduced_fact)

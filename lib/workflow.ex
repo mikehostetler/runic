@@ -3453,7 +3453,8 @@ defmodule Runic.Workflow do
 
     Enum.reduce_while(runnables, {workflow, false}, fn runnable, {wrk, false} ->
       {executed, events} = execute_with_policy(runnable, policies, driver_opts)
-      wrk = wrk |> append_runnable_events(events) |> apply_runnable(executed)
+      {wrk, executed, events} = apply_execution(wrk, executed, events)
+      wrk = append_runnable_events(wrk, events)
       result = {wrk, executed.status == :failed}
       if executed.status == :failed, do: {:halt, result}, else: {:cont, result}
     end)
@@ -3589,12 +3590,14 @@ defmodule Runic.Workflow do
          config
        )
        when is_list(events) do
-    apply_async_result(
-      {:result, ref, executed},
-      append_runnable_events(workflow, events),
+    {workflow, executed, events} = apply_execution(workflow, executed, events)
+    workflow = append_runnable_events(workflow, events)
+
+    async_cycle(
+      workflow,
       pending,
-      active,
-      stopped?,
+      Map.delete(active, ref),
+      stopped? or executed.status == :failed,
       config
     )
   end
@@ -3607,13 +3610,12 @@ defmodule Runic.Workflow do
          stopped?,
          config
        ) do
-    workflow = apply_runnable(workflow, executed)
-
-    async_cycle(
+    apply_async_result(
+      {:result, ref, {executed, []}},
       workflow,
       pending,
-      Map.delete(active, ref),
-      stopped? or executed.status == :failed,
+      active,
+      stopped?,
       config
     )
   end
@@ -4236,6 +4238,12 @@ defmodule Runic.Workflow do
     end
   end
 
+  @doc false
+  @spec activation_order_key(t(), struct(), Fact.t()) :: {non_neg_integer(), term()}
+  def activation_order_key(workflow, node, fact) do
+    {ancestry_depth(workflow, fact), Runnable.runnable_id(node, fact)}
+  end
+
   @doc """
   Returns the causal depth of a fact by walking its ancestry chain.
 
@@ -4517,11 +4525,26 @@ defmodule Runic.Workflow do
   """
   @spec apply_runnable(t(), Runnable.t()) :: t()
 
-  def apply_runnable(
-        %__MODULE__{} = workflow,
-        %Runnable{status: :completed, events: events} = runnable
-      )
-      when is_list(events) and events != [] do
+  def apply_runnable(workflow, runnable) do
+    {applied, _accepted, events} = apply_execution(workflow, runnable, [])
+    append_runnable_events(applied, events)
+  end
+
+  @doc false
+  @spec apply_execution(t(), Runnable.t(), list()) :: {t(), Runnable.t(), list()}
+  def apply_execution(workflow, runnable, events) do
+    {do_apply_runnable(workflow, runnable), runnable, events}
+  rescue
+    error in Runic.Identity.CanonicalError ->
+      {failed, failure_events} = PolicyDriver.reject_execution(runnable, error, events)
+      {do_apply_runnable(workflow, failed), failed, failure_events}
+  end
+
+  defp do_apply_runnable(
+         %__MODULE__{} = workflow,
+         %Runnable{status: :completed, events: events} = runnable
+       )
+       when is_list(events) and events != [] do
     # 1. Fold core events
     wf = Enum.reduce(events, workflow, fn event, wf -> apply_event(wf, event) end)
 
@@ -4566,11 +4589,11 @@ defmodule Runic.Workflow do
 
   # Skipped runnable: fold events (marks activation as consumed),
   # then skip all downstream nodes to prevent stalled workflows.
-  def apply_runnable(
-        %__MODULE__{} = workflow,
-        %Runnable{status: :skipped, events: events, node: node} = _runnable
-      )
-      when is_list(events) and events != [] do
+  defp do_apply_runnable(
+         %__MODULE__{} = workflow,
+         %Runnable{status: :skipped, events: events, node: node} = _runnable
+       )
+       when is_list(events) and events != [] do
     wf = Enum.reduce(events, workflow, fn event, wf -> apply_event(wf, event) end)
     wf = skip_downstream_subgraph(wf, node)
 
@@ -4581,11 +4604,11 @@ defmodule Runic.Workflow do
     end
   end
 
-  def apply_runnable(%__MODULE__{} = workflow, %Runnable{status: :failed} = runnable) do
+  defp do_apply_runnable(%__MODULE__{} = workflow, %Runnable{status: :failed} = runnable) do
     handle_failed_runnable(workflow, runnable)
   end
 
-  def apply_runnable(%__MODULE__{} = workflow, %Runnable{status: :pending}) do
+  defp do_apply_runnable(%__MODULE__{} = workflow, %Runnable{status: :pending}) do
     workflow
   end
 

@@ -37,7 +37,7 @@ defimpl Runic.Workflow.Coordinator, for: Runic.Workflow.FanIn do
         %Workflow{} = wf,
         %Runnable{
           input_fact: fact,
-          context: %{fan_in_context: %{mode: :fan_out_reduce} = fctx} = ctx
+          context: %{fan_in_context: %{mode: :fan_out_reduce} = fctx}
         }
       ) do
     completed_key = {:fan_in_completed, fctx.source_fact_hash, fan_in.hash}
@@ -58,14 +58,22 @@ defimpl Runic.Workflow.Coordinator, for: Runic.Workflow.FanIn do
       if ready do
         expected_in_order = Enum.reverse(expected_list)
 
-        sister_fact_values =
+        sister_facts =
           for origin <- expected_in_order do
             sister_hash = seen_map[origin]
-            wf.graph.vertices[sister_hash].value
+            wf.graph.vertices[sister_hash]
           end
 
-        reduced_value = fan_in_reduce(sister_fact_values, fan_in.init.(), fan_in.reducer)
-        reduced_fact = Fact.new(value: reduced_value, ancestry: {fan_in.hash, fact.hash})
+        reduced_value =
+          fan_in_reduce(Enum.map(sister_facts, & &1.value), fan_in.init.(), fan_in.reducer)
+
+        parent =
+          Enum.min_by(sister_facts, fn sister ->
+            {depth, id} = Workflow.activation_order_key(wf, fan_in, sister)
+            {-depth, id}
+          end)
+
+        reduced_fact = Fact.new(value: reduced_value, ancestry: {fan_in.hash, parent.hash})
 
         wf = Workflow.run_before_hooks(wf, fan_in, fact)
 
@@ -90,7 +98,7 @@ defimpl Runic.Workflow.Coordinator, for: Runic.Workflow.FanIn do
           result_ancestry: reduced_fact.ancestry,
           expected_key: fctx.expected_key,
           seen_key: fctx.seen_key,
-          weight: ctx.ancestry_depth + 1
+          weight: Workflow.ancestry_depth(wf, reduced_fact)
         }
 
         derived_events = sister_consumed_events ++ [completion_event]

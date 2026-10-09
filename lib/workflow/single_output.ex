@@ -122,7 +122,11 @@ defmodule Runic.Workflow.SingleOutput do
       {:error, reason} -> Runnable.fail(runnable, {:hook_error, reason})
     end
   rescue
-    exception -> Runnable.fail(runnable, exception)
+    exception in Runic.Identity.CanonicalError ->
+      Runnable.fail(runnable, {:value_encoding_failed, exception})
+
+    exception ->
+      Runnable.fail(runnable, exception)
   catch
     kind, reason -> Runnable.fail(runnable, {kind, reason})
   end
@@ -143,7 +147,11 @@ defmodule Runic.Workflow.SingleOutput do
   def complete_value(runnable, value) do
     complete(runnable, child_fact(runnable, Result.value(value)), [])
   rescue
-    exception -> Runnable.fail(runnable, exception)
+    exception in Runic.Identity.CanonicalError ->
+      Runnable.fail(runnable, {:value_encoding_failed, exception})
+
+    exception ->
+      Runnable.fail(runnable, exception)
   catch
     kind, reason -> Runnable.fail(runnable, {kind, reason})
   end

@@ -49,6 +49,20 @@ defmodule Runic.Workflow.PolicyDriver do
     end
   end
 
+  @doc false
+  @spec reject_execution(Runnable.t(), Exception.t(), list()) :: {Runnable.t(), list()}
+  def reject_execution(runnable, error, events) do
+    failed = Runnable.fail(runnable, {:value_encoding_failed, error})
+
+    retained =
+      Enum.reject(events, fn
+        %RunnableCompleted{runnable_id: id} -> id == runnable.id
+        _ -> false
+      end)
+
+    {failed, retained ++ [build_failed_event(failed, (runnable.attempt_number || 0) + 1, :halt)]}
+  end
+
   # ---------------------------------------------------------------------------
   # Non-event execution (original Phase 1 path)
   # ---------------------------------------------------------------------------
@@ -257,12 +271,19 @@ defmodule Runic.Workflow.PolicyDriver do
   # Timeout, backoff, retry helpers (shared)
   # ---------------------------------------------------------------------------
 
+  defp invoke(runnable) do
+    Invokable.execute(runnable.node, runnable)
+  rescue
+    error in Runic.Identity.CanonicalError ->
+      Runnable.fail(runnable, {:value_encoding_failed, error})
+  end
+
   defp execute_with_timeout(%Runnable{} = runnable, %SchedulerPolicy{} = policy, opts) do
     timeout_ms = effective_timeout(policy, opts)
 
     case timeout_ms do
       :infinity ->
-        Invokable.execute(runnable.node, runnable)
+        invoke(runnable)
 
       0 ->
         Runnable.fail(runnable, {:timeout, 0})
@@ -275,7 +296,7 @@ defmodule Runic.Workflow.PolicyDriver do
             fn ->
               case check_deadline(opts) do
                 :ok ->
-                  Invokable.execute(runnable.node, runnable)
+                  invoke(runnable)
 
                 {:deadline_exceeded, remaining} ->
                   Runnable.fail(runnable, {:deadline_exceeded, remaining})

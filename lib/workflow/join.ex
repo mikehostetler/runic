@@ -16,8 +16,7 @@ defimpl Runic.Workflow.Coordinator, for: Runic.Workflow.Join do
   alias Runic.Workflow.Events.JoinEdgeRelabeled
 
   def finalize(%Runic.Workflow.Join{} = join, %Workflow{} = wf, %Runnable{
-        input_fact: fact,
-        context: ctx
+        input_fact: fact
       }) do
     join_order_weights =
       join.joins
@@ -44,13 +43,18 @@ defimpl Runic.Workflow.Coordinator, for: Runic.Workflow.Join do
     can_complete = map_size(satisfied_by_parent) >= length(join.joins)
 
     if can_complete do
-      collected_values =
+      collected_facts =
         join.joins
         |> Enum.map(&Map.get(satisfied_by_parent, &1))
         |> Enum.reject(&is_nil/1)
-        |> Enum.map(& &1.value)
 
-      join_fact = Fact.new(value: collected_values, ancestry: {join.hash, fact.hash})
+      parent =
+        Enum.max_by(collected_facts, &Workflow.activation_order_key(wf, join, &1), &>=/2, fn ->
+          fact
+        end)
+
+      join_fact =
+        Fact.new(value: Enum.map(collected_facts, & &1.value), ancestry: {join.hash, parent.hash})
 
       wf = Workflow.run_before_hooks(wf, join, fact)
 
@@ -59,7 +63,7 @@ defimpl Runic.Workflow.Coordinator, for: Runic.Workflow.Join do
         result_fact_hash: join_fact.hash,
         result_value: join_fact.value,
         result_ancestry: join_fact.ancestry,
-        weight: ctx.ancestry_depth + 1
+        weight: Workflow.ancestry_depth(wf, join_fact)
       }
 
       relabel_events =

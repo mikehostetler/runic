@@ -704,6 +704,7 @@ defmodule Runic.Runner.Worker do
     {dispatch_time, dispatch_times} = Map.pop(state.dispatch_times, ref)
 
     duration = if dispatch_time, do: System.monotonic_time(:millisecond) - dispatch_time, else: 0
+    {workflow, executed, events} = Workflow.apply_execution(state.workflow, executed, events)
     emit_runnable_result(executed, state.id, dispatch_time)
 
     case executed.status do
@@ -716,8 +717,6 @@ defmodule Runic.Runner.Worker do
       _ ->
         :ok
     end
-
-    workflow = Workflow.apply_runnable(state.workflow, executed)
 
     workflow =
       if events != [] do
@@ -1016,8 +1015,8 @@ defmodule Runic.Runner.Worker do
 
     executed = execute_runnable(runnable, policy)
 
-    # Normalize to {runnable, events}
-    {executed_runnable, _events} =
+    # Normalize the computation result, then retain the local acceptance outcome.
+    {executed_runnable, events} =
       case executed do
         {%Runnable{} = r, events} -> {r, events}
         %Runnable{} = r -> {r, []}
@@ -1028,17 +1027,23 @@ defmodule Runic.Runner.Worker do
         {:promise_partial, promise.id, Enum.reverse(completed), executed}
 
       _ ->
-        # Apply to local workflow copy so next runnable sees updated state
-        wf = Workflow.apply_runnable(workflow, executed_runnable)
-        # Prepare next runnables and find those in our chain
-        {wf, next_runnables} = Workflow.prepare_for_dispatch(wf)
+        {wf, accepted, events} = Workflow.apply_execution(workflow, executed_runnable, events)
+        result = {accepted, events}
 
-        chain_runnables =
-          Enum.filter(next_runnables, fn r ->
-            MapSet.member?(promise.node_hashes, r.node.hash)
-          end)
+        case accepted.status do
+          :failed ->
+            {:promise_partial, promise.id, Enum.reverse(completed), result}
 
-        resolve_promise_loop(promise, wf, policies, chain_runnables, [executed | completed])
+          _ ->
+            {wf, next_runnables} = Workflow.prepare_for_dispatch(wf)
+
+            chain_runnables =
+              Enum.filter(next_runnables, fn r ->
+                MapSet.member?(promise.node_hashes, r.node.hash)
+              end)
+
+            resolve_promise_loop(promise, wf, policies, chain_runnables, [result | completed])
+        end
     end
   end
 
@@ -1157,6 +1162,9 @@ defmodule Runic.Runner.Worker do
           %Runnable{} = r -> {r, []}
         end
 
+      {workflow, executed_runnable, events} =
+        Workflow.apply_execution(acc.workflow, executed_runnable, events)
+
       emit_runnable_result(executed_runnable, acc.id, nil)
 
       case executed_runnable.status do
@@ -1169,8 +1177,6 @@ defmodule Runic.Runner.Worker do
         _ ->
           :ok
       end
-
-      workflow = Workflow.apply_runnable(acc.workflow, executed_runnable)
 
       workflow =
         if events != [] do
