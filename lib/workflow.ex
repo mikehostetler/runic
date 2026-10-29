@@ -249,6 +249,7 @@ defmodule Runic.Workflow do
   alias Runic.Workflow.RunnableFailed
   alias Runic.Workflow.ExecutionUncertain
   alias Runic.Workflow.Execution
+  alias Runic.Workflow.AsyncTransport
   alias Runic.Workflow.Private
   alias Runic.Workflow.Events.FactProduced
   alias Runic.Workflow.Events.ActivationConsumed
@@ -3810,6 +3811,17 @@ defmodule Runic.Workflow do
   - `:async` - When `true`, executes runnables in parallel in a caller-owned task scope.
     Useful for I/O-bound workflows. Default: `false` (serial execution)
   - `:max_concurrency` - Maximum parallel tasks when `async: true`. Default: `System.schedulers_online()`
+  - `:max_inflight_bytes` - Maximum estimated bytes for active async requests.
+    The scheduler always admits one request to prevent a large request from
+    blocking forever. Default: `:infinity`
+  - `:async_transport` - Experimental process transport. `:full` keeps the
+    current full Runnable. `:compact` removes repeated request and completion
+    data. `:binary` sends the compact data in a reference-counted binary.
+    `:ets` passes owner-owned ETS keys and copies each value only at its use site.
+    Default: `:full`
+  - `:async_placement` - Experimental unary function that returns `:inline` or
+    `:task` for each Runnable. Inline work runs in the workflow owner. Default:
+    all Runnables use tasks.
   - `:timeout` - Timeout for each task when `async: true`. Default: `:infinity`
   - `:runnable_order` - `:stable` orders ready work by causal depth and activation
     identity. A one-argument function supplies a consumer sort key for each
@@ -3896,6 +3908,9 @@ defmodule Runic.Workflow do
 
   defp execute_runnables_async(workflow, runnables, opts, execution) do
     max_concurrency = Keyword.get(opts, :max_concurrency, System.schedulers_online())
+    max_inflight_bytes = Keyword.get(opts, :max_inflight_bytes, :infinity)
+    async_transport = Keyword.get(opts, :async_transport, :full)
+    async_placement = Keyword.get(opts, :async_placement, fn _runnable -> :task end)
     timeout = Keyword.get(opts, :timeout, :infinity)
     policies = resolve_effective_policies(workflow, opts)
     driver_opts = Keyword.put(build_driver_opts(opts), :emit_events, workflow.emit_events)
@@ -3908,16 +3923,39 @@ defmodule Runic.Workflow do
       raise ArgumentError, "timeout must be a non-negative integer or :infinity"
     end
 
+    unless max_inflight_bytes == :infinity or
+             (is_integer(max_inflight_bytes) and max_inflight_bytes > 0) do
+      raise ArgumentError, "max_inflight_bytes must be a positive integer or :infinity"
+    end
+
+    unless async_transport in [:full, :compact, :binary, :ets] do
+      raise ArgumentError, "async_transport must be :full, :compact, :binary, or :ets"
+    end
+
+    unless is_function(async_placement, 1) do
+      raise ArgumentError, "async_placement must be a unary function"
+    end
+
     Runic.TaskScope.with_scope(fn scope ->
+      transport_store = AsyncTransport.open(async_transport)
+
       config = %{
         scope: scope,
         max_concurrency: max_concurrency,
+        max_inflight_bytes: max_inflight_bytes,
+        async_transport: async_transport,
+        transport_store: transport_store,
+        async_placement: async_placement,
         timeout: timeout,
         execution: execution,
         execute: &execute_with_policy(&1, policies, driver_opts)
       }
 
-      async_cycle(workflow, runnables, %{}, false, config)
+      try do
+        async_cycle(workflow, runnables, %{}, false, config)
+      after
+        AsyncTransport.close(async_transport, transport_store)
+      end
     end)
   end
 
@@ -3945,12 +3983,37 @@ defmodule Runic.Workflow do
     case receive_async_result(active, 0) do
       nil ->
         cond do
-          not stopped? and pending != [] and map_size(active) < config.max_concurrency ->
+          not stopped? and pending != [] and inline_runnable?(hd(pending), config) ->
+            [runnable | rest] = pending
+
+            apply_inline_async_result(
+              config.execute.(runnable),
+              workflow,
+              rest,
+              active,
+              stopped?,
+              config
+            )
+
+          not stopped? and pending != [] and map_size(active) < config.max_concurrency and
+              can_admit_request?(pending, active, config) ->
             [runnable | rest] = pending
             execute = config.execute
 
+            request =
+              AsyncTransport.prepare(runnable, config.async_transport, config.transport_store)
+
+            request_bytes = AsyncTransport.byte_size(request)
+
             {handle, pid} =
-              Runic.TaskScope.dispatch(config.scope, fn -> execute.(runnable) end)
+              Runic.TaskScope.dispatch(config.scope, fn ->
+                AsyncTransport.execute(
+                  request,
+                  execute,
+                  config.async_transport,
+                  config.transport_store
+                )
+              end)
 
             deadline =
               if config.timeout == :infinity,
@@ -3960,7 +4023,7 @@ defmodule Runic.Workflow do
             async_cycle(
               workflow,
               rest,
-              Map.put(active, handle, {pid, deadline, runnable}),
+              Map.put(active, handle, {pid, deadline, runnable, request_bytes}),
               stopped?,
               config
             )
@@ -3978,8 +4041,8 @@ defmodule Runic.Workflow do
 
             case receive_async_result(active, wait) do
               nil ->
-                {ref, {_pid, _, _runnable}} =
-                  Enum.find(active, fn {_, {_, at, _}} -> at == deadline end)
+                {ref, {_pid, _, _runnable, _request_bytes}} =
+                  Enum.find(active, fn {_, {_, at, _, _}} -> at == deadline end)
 
                 :ok = Runic.TaskScope.cancel(config.scope, ref)
 
@@ -4019,8 +4082,88 @@ defmodule Runic.Workflow do
     end
   end
 
+  defp can_admit_request?(_pending, active, _config) when map_size(active) == 0, do: true
+
+  defp can_admit_request?([runnable | _rest], active, config) do
+    case config.max_inflight_bytes do
+      :infinity ->
+        true
+
+      limit ->
+        active_bytes =
+          Enum.sum(for {_pid, _deadline, _runnable, bytes} <- Map.values(active), do: bytes)
+
+        active_bytes + AsyncTransport.estimate_bytes(runnable, config.async_transport) <= limit
+    end
+  end
+
+  defp inline_runnable?(runnable, config) do
+    case config.async_placement.(runnable) do
+      :inline -> true
+      :task -> false
+      other -> raise ArgumentError, "async_placement returned invalid value: #{inspect(other)}"
+    end
+  end
+
   defp apply_async_result(
-         {:result, ref, {%Runnable{} = executed, events}},
+         {:result, ref, transported},
+         workflow,
+         pending,
+         active,
+         stopped?,
+         config
+       ) do
+    {_pid, _deadline, original, _request_bytes} = Map.fetch!(active, ref)
+
+    case accept_async_result(
+           original,
+           transported,
+           config.async_transport,
+           config.transport_store
+         ) do
+      {:ok, accepted} ->
+        apply_accepted_async_result(
+          ref,
+          accepted,
+          workflow,
+          pending,
+          active,
+          stopped?,
+          config
+        )
+
+      :error ->
+        apply_async_result(
+          {:down, ref, :invalid_result},
+          workflow,
+          pending,
+          active,
+          stopped?,
+          config
+        )
+    end
+  end
+
+  defp apply_async_result({:down, ref, reason}, workflow, pending, active, _stopped?, config) do
+    Logger.warning("Async execution outcome is uncertain: #{inspect(reason)}")
+    {_pid, _deadline, runnable, _request_bytes} = Map.fetch!(active, ref)
+    workflow = record_execution_loss(workflow, runnable, reason)
+
+    execution =
+      Execution.record_uncertain(config.execution, workflow, {:runnable, runnable}, reason)
+
+    config = %{config | execution: execution}
+    async_cycle(workflow, pending, Map.delete(active, ref), true, config)
+  end
+
+  defp accept_async_result(original, transported, mode, store) do
+    {:ok, AsyncTransport.accept(original, transported, mode, store)}
+  rescue
+    _error -> :error
+  end
+
+  defp apply_inline_async_result(
+         {%Runnable{} = executed, events},
          workflow,
          pending,
          active,
@@ -4028,8 +4171,8 @@ defmodule Runic.Workflow do
          config
        )
        when is_list(events) do
-    apply_async_result(
-      {:result, ref, executed},
+    apply_inline_async_result(
+      executed,
       append_runnable_events(workflow, events),
       pending,
       active,
@@ -4038,8 +4181,54 @@ defmodule Runic.Workflow do
     )
   end
 
-  defp apply_async_result(
-         {:result, ref, %Runnable{} = executed},
+  defp apply_inline_async_result(
+         %Runnable{} = executed,
+         workflow,
+         pending,
+         active,
+         stopped?,
+         config
+       ) do
+    workflow = apply_runnable(workflow, executed)
+    config = %{config | execution: Execution.record(config.execution, workflow, executed)}
+
+    async_cycle(
+      workflow,
+      pending,
+      active,
+      stopped? or executed.status == :failed,
+      config
+    )
+  end
+
+  defp apply_inline_async_result(_invalid, _workflow, _pending, _active, _stopped?, _config) do
+    raise ArgumentError, "inline async execution returned an invalid result"
+  end
+
+  defp apply_accepted_async_result(
+         ref,
+         {%Runnable{} = executed, events},
+         workflow,
+         pending,
+         active,
+         stopped?,
+         config
+       )
+       when is_list(events) do
+    apply_accepted_async_result(
+      ref,
+      executed,
+      append_runnable_events(workflow, events),
+      pending,
+      active,
+      stopped?,
+      config
+    )
+  end
+
+  defp apply_accepted_async_result(
+         ref,
+         %Runnable{} = executed,
          workflow,
          pending,
          active,
@@ -4058,20 +4247,16 @@ defmodule Runic.Workflow do
     )
   end
 
-  defp apply_async_result({:result, ref, _invalid}, workflow, pending, active, stopped?, config) do
+  defp apply_accepted_async_result(
+         ref,
+         _invalid,
+         workflow,
+         pending,
+         active,
+         stopped?,
+         config
+       ) do
     apply_async_result({:down, ref, :invalid_result}, workflow, pending, active, stopped?, config)
-  end
-
-  defp apply_async_result({:down, ref, reason}, workflow, pending, active, _stopped?, config) do
-    Logger.warning("Async execution outcome is uncertain: #{inspect(reason)}")
-    {_pid, _deadline, runnable} = Map.fetch!(active, ref)
-    workflow = record_execution_loss(workflow, runnable, reason)
-
-    execution =
-      Execution.record_uncertain(config.execution, workflow, {:runnable, runnable}, reason)
-
-    config = %{config | execution: execution}
-    async_cycle(workflow, pending, Map.delete(active, ref), true, config)
   end
 
   defp record_execution_loss(%__MODULE__{emit_events: true} = workflow, runnable, reason) do
